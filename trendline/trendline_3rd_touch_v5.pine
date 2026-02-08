@@ -1,0 +1,241 @@
+//@version=5
+indicator("Trendline 3rd Touch Alert (2 touches in last N bars)", overlay=true, max_lines_count=10, max_labels_count=20)
+
+// ───── Inputs ────────────────────────────────────────────────────────────────
+lookbackBars   = input.int(100,  "Lookback bars",           minval=30, maxval=500)
+leftBars       = input.int(3,    "Pivot left bars",         minval=1,  maxval=10)
+rightBars      = input.int(3,    "Pivot right bars",        minval=1,  maxval=10)
+maxPivots      = input.int(10,   "Max pivots stored",       minval=4,  maxval=30)
+minPivotDist   = input.int(10,   "Min bars between pivots", minval=2,  maxval=100)
+
+// Touch tolerance
+tolMode        = input.string("ATR", "Tolerance mode", options=["ATR", "Ticks"])
+tolTicks       = input.float(5.0,  "Tolerance (ticks)",    minval=0.0, step=0.5)
+tolAtrMult     = input.float(0.15, "Tolerance (ATR mult)", minval=0.0, step=0.01)
+atrLen         = input.int(14,   "ATR length",             minval=1,  maxval=100)
+
+// Filters
+requireNoBreak = input.bool(true, "Require no break between pivot1 and now")
+
+// Display
+showSupport    = input.bool(true, "Show best support (2-touch) trendline")
+showResistance = input.bool(true, "Show best resistance (2-touch) trendline")
+lineWidth      = input.int(2, "Line width", minval=1, maxval=4)
+
+// ───── Tolerance ─────────────────────────────────────────────────────────────
+atrVal = ta.atr(atrLen)
+tol    = tolMode == "ATR" ? atrVal * tolAtrMult : syminfo.mintick * tolTicks
+
+// ───── Pivot detection ───────────────────────────────────────────────────────
+pivLow  = ta.pivotlow(low,  leftBars, rightBars)
+pivHigh = ta.pivothigh(high, leftBars, rightBars)
+
+var pivLowIdx    = array.new_int()
+var pivLowPrice  = array.new_float()
+var pivHighIdx   = array.new_int()
+var pivHighPrice = array.new_float()
+
+// Store new pivot lows/highs. Note: pivot value appears rightBars bars AFTER the pivot.
+if not na(pivLow)
+    idx = bar_index - rightBars
+    array.push(pivLowIdx, idx)
+    array.push(pivLowPrice, pivLow)
+
+if not na(pivHigh)
+    idx = bar_index - rightBars
+    array.push(pivHighIdx, idx)
+    array.push(pivHighPrice, pivHigh)
+
+// Trim old pivots and cap count
+f_trim(_idxArr, _pxArr) =>
+    // remove pivots outside lookback
+    while array.size(_idxArr) > 0 and array.get(_idxArr, 0) < (bar_index - lookbackBars)
+        array.shift(_idxArr)
+        array.shift(_pxArr)
+    // cap array sizes
+    while array.size(_idxArr) > maxPivots
+        array.shift(_idxArr)
+        array.shift(_pxArr)
+
+f_trim(pivLowIdx, pivLowPrice)
+f_trim(pivHighIdx, pivHighPrice)
+
+// ───── Math helpers ──────────────────────────────────────────────────────────
+f_lineY(float y1, float y2, int x1, int x2, int x) =>
+    m = (y2 - y1) / (x2 - x1)
+    y1 + m * (x - x1)
+
+// Scan candidate line from x1 .. (bar_index-1): count debounced touches and detect breaks.
+// Returns [touchCount, isBroken]
+scanLine(int x1, float y1, int x2, float y2, bool isSupport) =>
+    touches = 0
+    broken  = false
+    prevTouch = false
+
+    // start no earlier than lookback window
+    startX = math.max(x1, bar_index - lookbackBars + 1)
+    endX   = bar_index - 1
+
+    if endX >= startX
+        for x = startX to endX
+            off = bar_index - x
+            projY  = f_lineY(y1, y2, x1, x2, x)
+            testP  = isSupport ? low[off] : high[off]
+            closeP = close[off]
+
+            inTouchNow = math.abs(testP - projY) <= tol
+            if inTouchNow and not prevTouch
+                touches += 1
+            prevTouch := inTouchNow
+
+            if requireNoBreak
+                if isSupport and closeP < projY - tol
+                    broken := true
+                if (not isSupport) and closeP > projY + tol
+                    broken := true
+
+    [touches, broken]
+
+// ───── Persistent drawing objects ────────────────────────────────────────────
+var line  bestSupLine = na
+var line  bestResLine = na
+var label supLabel    = na
+var label resLabel    = na
+
+// Persistent keys to avoid duplicate alerts for the same pivot pair
+var string lastSupKey = ""
+var string lastResKey = ""
+
+// Fire flags (reset every bar)
+supAlertFire = false
+resAlertFire = false
+
+// ───── Find best support line (two pivot lows) ───────────────────────────────
+if showSupport and barstate.islast
+    // delete previous drawings
+    if not na(bestSupLine)
+        line.delete(bestSupLine)
+        bestSupLine := na
+    if not na(supLabel)
+        label.delete(supLabel)
+        supLabel := na
+
+    bestX1 = na
+    bestX2 = na
+    bestY1 = na
+    bestY2 = na
+    found  = false
+
+    sz = array.size(pivLowIdx)
+    if sz >= 2
+        // Choose the first valid candidate when iterating x2 from most-recent to older
+        for j = sz - 1 to 1 by -1
+            if found
+                break
+            xj = array.get(pivLowIdx, j)
+            yj = array.get(pivLowPrice, j)
+
+            for i = j - 1 to 0 by -1
+                xi = array.get(pivLowIdx, i)
+                yi = array.get(pivLowPrice, i)
+
+                if (xj - xi) < minPivotDist
+                    continue
+
+                [touches, broken] = scanLine(xi, yi, xj, yj, true)
+
+                if touches == 2 and not broken
+                    bestX1 := xi
+                    bestX2 := xj
+                    bestY1 := yi
+                    bestY2 := yj
+                    found  := true
+                    break
+
+    if found
+        endY = f_lineY(bestY1, bestY2, bestX1, bestX2, bar_index)
+        bestSupLine := line.new(bestX1, bestY1, bar_index, endY, extend=extend.right,
+             color=color.new(color.lime, 0), width=lineWidth)
+        supLabel := label.new(bar_index + 3, endY, "Support (2T)",
+             color=color.new(color.lime, 85), textcolor=color.lime, style=label.style_label_left, size=size.tiny)
+
+        // 3rd touch on current bar (line had exactly 2 historical touches)
+        projNow = f_lineY(bestY1, bestY2, bestX1, bestX2, bar_index)
+        touchNow = math.abs(low - projNow) <= tol
+        curKey = str.tostring(bestX1) + "_" + str.tostring(bestX2) + "_sup"
+        if touchNow and curKey != lastSupKey
+            supAlertFire := true
+            lastSupKey := curKey
+
+// ───── Find best resistance line (two pivot highs) ───────────────────────────
+if showResistance and barstate.islast
+    if not na(bestResLine)
+        line.delete(bestResLine)
+        bestResLine := na
+    if not na(resLabel)
+        label.delete(resLabel)
+        resLabel := na
+
+    bestX1 = na
+    bestX2 = na
+    bestY1 = na
+    bestY2 = na
+    found  = false
+
+    sz = array.size(pivHighIdx)
+    if sz >= 2
+        for j = sz - 1 to 1 by -1
+            if found
+                break
+            xj = array.get(pivHighIdx, j)
+            yj = array.get(pivHighPrice, j)
+
+            for i = j - 1 to 0 by -1
+                xi = array.get(pivHighIdx, i)
+                yi = array.get(pivHighPrice, i)
+
+                if (xj - xi) < minPivotDist
+                    continue
+
+                [touches, broken] = scanLine(xi, yi, xj, yj, false)
+
+                if touches == 2 and not broken
+                    bestX1 := xi
+                    bestX2 := xj
+                    bestY1 := yi
+                    bestY2 := yj
+                    found  := true
+                    break
+
+    if found
+        endY = f_lineY(bestY1, bestY2, bestX1, bestX2, bar_index)
+        bestResLine := line.new(bestX1, bestY1, bar_index, endY, extend=extend.right,
+             color=color.new(color.red, 0), width=lineWidth)
+        resLabel := label.new(bar_index + 3, endY, "Resistance (2T)",
+             color=color.new(color.red, 85), textcolor=color.red, style=label.style_label_left, size=size.tiny)
+
+        projNow = f_lineY(bestY1, bestY2, bestX1, bestX2, bar_index)
+        touchNow = math.abs(high - projNow) <= tol
+        curKey = str.tostring(bestX1) + "_" + str.tostring(bestX2) + "_res"
+        if touchNow and curKey != lastResKey
+            resAlertFire := true
+            lastResKey := curKey
+
+// ───── Alerts ────────────────────────────────────────────────────────────────
+// NOTE: To receive script-driven alerts, create an alert in TradingView with condition:
+//   "Any alert() function call".
+if supAlertFire
+    alert("3rd touch on SUPPORT trendline (" + syminfo.tickerid + ")", alert.freq_once_per_bar)
+
+if resAlertFire
+    alert("3rd touch on RESISTANCE trendline (" + syminfo.tickerid + ")", alert.freq_once_per_bar)
+
+// Optional UI-managed alerts
+alertcondition(supAlertFire, title="3rd touch (support)", message="3rd touch on support trendline")
+alertcondition(resAlertFire, title="3rd touch (resistance)", message="3rd touch on resistance trendline")
+
+// Visual markers
+plotshape(supAlertFire, title="3rd touch support", location=location.belowbar,
+     color=color.lime, style=shape.triangleup, size=size.tiny, text="3rd")
+plotshape(resAlertFire, title="3rd touch resistance", location=location.abovebar,
+     color=color.red, style=shape.triangledown, size=size.tiny, text="3rd")

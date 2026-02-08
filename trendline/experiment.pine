@@ -1,0 +1,247 @@
+//@version=5
+indicator("2-Touch Trendline Scanner (last 100) + 3rd Touch Alert", overlay=true, max_lines_count=20, calc_on_every_tick=true)
+
+//====================
+// Inputs
+//====================
+lookbackBars      = input.int(100, "Lookback bars", minval=20, maxval=500)
+leftBars          = input.int(3,   "Pivot left bars", minval=1, maxval=20)
+rightBars         = input.int(3,   "Pivot right bars", minval=1, maxval=20)
+maxPivots         = input.int(10,  "Max pivots stored (per side)", minval=5, maxval=30)
+minPivotDistance  = input.int(10,  "Min distance between pivot anchors (bars)", minval=1, maxval=100)
+
+// Tolerance
+tolMode = input.string("ATR", "Touch tolerance mode", options=["ATR", "Ticks"])
+atrLen  = input.int(14, "ATR length", minval=1)
+tolAtrMult  = input.float(0.25, "ATR tolerance multiplier", minval=0.0, step=0.05)
+tolTicks    = input.int(5, "Tick tolerance", minval=0)
+
+// Filters
+requireNoBreak = input.bool(false, "Require no break between pivot1 and now")
+useSlopeFilter = input.bool(false, "Use slope filter (ATR-normalized)")
+maxSlopeAtrMult = input.float(1.0, "Max slope (ATR per bar)", minval=0.0, step=0.1)
+
+// Drawing
+drawSupport    = input.bool(true, "Draw best support line")
+drawResistance = input.bool(true, "Draw best resistance line")
+lineWidth      = input.int(2, "Line width", minval=1, maxval=4)
+
+//====================
+// Helpers
+//====================
+atr = ta.atr(atrLen)
+float tol = tolMode == "ATR" ? (atr * tolAtrMult) : (syminfo.mintick * tolTicks)
+
+f_y(float y1, int x1, float m, int x) =>
+    y1 + m * (x - x1)
+
+//====================
+// Store pivots
+//====================
+var pivotLowIdx  = array.new_int()
+var pivotLowPx   = array.new_float()
+var pivotHighIdx = array.new_int()
+var pivotHighPx  = array.new_float()
+
+pl = ta.pivotlow(low, leftBars, rightBars)
+ph = ta.pivothigh(high, leftBars, rightBars)
+
+// Add newly confirmed pivot lows/highs
+if not na(pl)
+    idx = bar_index - rightBars
+    array.push(pivotLowIdx, idx)
+    array.push(pivotLowPx,  pl)
+
+if not na(ph)
+    idx = bar_index - rightBars
+    array.push(pivotHighIdx, idx)
+    array.push(pivotHighPx,  ph)
+
+// Keep arrays bounded by maxPivots and lookbackBars
+f_trim(var int[] aIdx, var float[] aPx) =>
+    // remove too-old
+    while array.size(aIdx) > 0 and array.get(aIdx, 0) < (bar_index - lookbackBars)
+        array.shift(aIdx)
+        array.shift(aPx)
+    // cap size
+    while array.size(aIdx) > maxPivots
+        array.shift(aIdx)
+        array.shift(aPx)
+
+f_trim(pivotLowIdx, pivotLowPx)
+f_trim(pivotHighIdx, pivotHighPx)
+
+//====================
+// Candidate type
+//====================
+type Candidate
+    bool  ok
+    int   x1
+    float y1
+    int   x2
+    float y2
+    float m
+    int   touchesBefore
+
+f_emptyCandidate() =>
+    Candidate.new(false, na, na, na, na, na, 0)
+
+//====================
+// Evaluate best candidate for one family
+//   isSupport = true  => pivot lows, use low for touches/breaks
+//   isSupport = false => pivot highs, use high for touches/breaks
+// The candidate must have exactly 2 touches in the lookback window *before* the current bar.
+//====================
+f_findBestCandidate(bool isSupport) =>
+    int[]   idxArr = isSupport ? pivotLowIdx  : pivotHighIdx
+    float[] pxArr  = isSupport ? pivotLowPx   : pivotHighPx
+
+    int n = array.size(idxArr)
+    Candidate best = f_emptyCandidate()
+
+    // if fewer than 2 pivots, no candidate
+    if n < 2
+        best
+    else
+        for i = 0 to n - 2
+            for j = i + 1 to n - 1
+                x1 = array.get(idxArr, i)
+                y1 = array.get(pxArr, i)
+                x2 = array.get(idxArr, j)
+                y2 = array.get(pxArr, j)
+
+                // basic anchor constraints
+                if x2 > x1 and (x2 - x1) >= minPivotDistance and x1 >= (bar_index - lookbackBars)
+                    m = (y2 - y1) / (x2 - x1)
+
+                    // optional slope filter (units: price per bar)
+                    slopeOk = (not useSlopeFilter) or (abs(m) <= (atr * maxSlopeAtrMult))
+
+                    if slopeOk
+                        // Scan touches/breaks from max(x1, lookback start) to previous bar
+                        startX = math.max(x1, bar_index - lookbackBars + 1)
+                        endX   = bar_index - 1
+
+                        // if we don't have enough history (early bars)
+                        if endX >= startX
+                            int touchCount = 0
+                            bool prevTouch = false
+                            bool broke = false
+
+                            // Iterate from oldest -> newest for stable debouncing
+                            for x = startX to endX
+                                off = bar_index - x
+                                lineY = f_y(y1, x1, m, x)
+
+                                float testPx = isSupport ? low[off] : high[off]
+                                bool inTouch = math.abs(testPx - lineY) <= tol
+
+                                // debounce: count only touch transitions
+                                if inTouch and not prevTouch
+                                    touchCount += 1
+                                prevTouch := inTouch
+
+                                if requireNoBreak
+                                    float breakPx = close[off]
+                                    broke := broke or (isSupport ? (breakPx < lineY - tol) : (breakPx > lineY + tol))
+
+                            if (not broke) and touchCount == 2
+                                // Scoring: prefer most recent second pivot
+                                bool isBetter = not best.ok or (x2 > best.x2)
+                                if isBetter
+                                    best := Candidate.new(true, x1, y1, x2, y2, m, touchCount)
+
+        best
+
+//====================
+// Find best support/resistance candidates
+//====================
+Candidate bestSup = f_findBestCandidate(true)
+Candidate bestRes = f_findBestCandidate(false)
+
+//====================
+// Drawing (keep 2 persistent lines)
+//====================
+var line supLine = na
+var line resLine = na
+var string lastSupKey = ""
+var string lastResKey = ""
+
+f_key(Candidate c) =>
+    str.tostring(c.x1) + "_" + str.tostring(c.x2)
+
+// Update / redraw support line
+if drawSupport
+    if bestSup.ok
+        supKey = f_key(bestSup)
+        supYNow = f_y(bestSup.y1, bestSup.x1, bestSup.m, bar_index)
+
+        if supKey != lastSupKey or na(supLine)
+            if not na(supLine)
+                line.delete(supLine)
+            supLine := line.new(bestSup.x1, bestSup.y1, bar_index, supYNow, extend=extend.right, color=color.new(color.lime, 0), width=lineWidth)
+            lastSupKey := supKey
+        else
+            line.set_xy1(supLine, bestSup.x1, bestSup.y1)
+            line.set_xy2(supLine, bar_index, supYNow)
+    else
+        // no valid line
+        if not na(supLine)
+            line.delete(supLine)
+        supLine := na
+        lastSupKey := ""
+
+// Update / redraw resistance line
+if drawResistance
+    if bestRes.ok
+        resKey = f_key(bestRes)
+        resYNow = f_y(bestRes.y1, bestRes.x1, bestRes.m, bar_index)
+
+        if resKey != lastResKey or na(resLine)
+            if not na(resLine)
+                line.delete(resLine)
+            resLine := line.new(bestRes.x1, bestRes.y1, bar_index, resYNow, extend=extend.right, color=color.new(color.red, 0), width=lineWidth)
+            lastResKey := resKey
+        else
+            line.set_xy1(resLine, bestRes.x1, bestRes.y1)
+            line.set_xy2(resLine, bar_index, resYNow)
+    else
+        if not na(resLine)
+            line.delete(resLine)
+        resLine := na
+        lastResKey := ""
+
+//====================
+// 3rd touch detection (current bar touch after exactly 2 touches before)
+//====================
+var string lastAlertSupKey = ""
+var string lastAlertResKey = ""
+
+bool supThirdTouch = false
+bool resThirdTouch = false
+
+if bestSup.ok
+    supYNow = f_y(bestSup.y1, bestSup.x1, bestSup.m, bar_index)
+    supThirdTouch := math.abs(low - supYNow) <= tol
+
+if bestRes.ok
+    resYNow = f_y(bestRes.y1, bestRes.x1, bestRes.m, bar_index)
+    resThirdTouch := math.abs(high - resYNow) <= tol
+
+// Use alert() for a direct experience. User still needs to create an alert of type:
+// "Any alert() function call" in TradingView.
+if supThirdTouch
+    k = f_key(bestSup)
+    if k != lastAlertSupKey
+        alert("3rd touch on SUPPORT trendline: pivots " + str.tostring(bestSup.x1) + " & " + str.tostring(bestSup.x2), alert.freq_once_per_bar)
+        lastAlertSupKey := k
+
+if resThirdTouch
+    k = f_key(bestRes)
+    if k != lastAlertResKey
+        alert("3rd touch on RESISTANCE trendline: pivots " + str.tostring(bestRes.x1) + " & " + str.tostring(bestRes.x2), alert.freq_once_per_bar)
+        lastAlertResKey := k
+
+// Optional alertcondition (bar-close style). Some users prefer to use the UI-driven alert system.
+alertcondition(supThirdTouch, "3rd touch (support)", "3rd touch on support trendline")
+alertcondition(resThirdTouch, "3rd touch (resistance)", "3rd touch on resistance trendline")
